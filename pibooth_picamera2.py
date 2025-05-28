@@ -19,20 +19,70 @@ from pibooth.camera.rpi import RpiCamera
 from pibooth.camera.gphoto import GpCamera
 from pibooth.language import get_translated_text
 
+# Check pibooth version
+try:
+    import pibooth
+    LOGGER.info(f"Pibooth version: {pibooth.__version__}")
+except:
+    LOGGER.warning("Could not determine pibooth version")
+
 # Try to import get_gp_camera_proxy
+get_gp_camera_proxy = None
 try:
     from pibooth.camera import get_gp_camera_proxy
     LOGGER.info("Successfully imported get_gp_camera_proxy from pibooth.camera")
 except ImportError as e:
     LOGGER.error(f"Failed to import get_gp_camera_proxy: {e}")
-    # Define a dummy function if import fails
+    # Try alternative imports
+    try:
+        from pibooth.camera.plugin import get_gp_camera_proxy
+        LOGGER.info("Found get_gp_camera_proxy in pibooth.camera.plugin")
+    except:
+        try:
+            import pibooth.camera
+            if hasattr(pibooth.camera, 'get_gp_camera_proxy'):
+                get_gp_camera_proxy = pibooth.camera.get_gp_camera_proxy
+                LOGGER.info("Found get_gp_camera_proxy as attribute of pibooth.camera")
+            else:
+                LOGGER.error("get_gp_camera_proxy not found in pibooth.camera")
+                # List what's available
+                LOGGER.info(f"Available in pibooth.camera: {dir(pibooth.camera)}")
+        except Exception as e:
+            LOGGER.error(f"Failed all import attempts: {e}")
+
+# If we still don't have the function, create our own
+if get_gp_camera_proxy is None:
+    LOGGER.warning("Creating custom get_gp_camera_proxy function")
     def get_gp_camera_proxy():
-        LOGGER.error("get_gp_camera_proxy not available - import failed")
-        return None
+        """Custom implementation of get_gp_camera_proxy"""
+        try:
+            import gphoto2 as gp
+            # Initialize logging
+            gp.check_result(gp.use_python_logging())
+            
+            # Create camera object
+            camera = gp.Camera()
+            
+            # Initialize camera
+            camera.init()
+            
+            LOGGER.info("Custom get_gp_camera_proxy: Camera initialized successfully")
+            return camera
+        except Exception as e:
+            LOGGER.error(f"Custom get_gp_camera_proxy failed: {e}")
+            return None
+
+# Try alternative import method
+try:
+    import pibooth.camera.gphoto as gphoto_module
+    LOGGER.info("Successfully imported pibooth.camera.gphoto module")
+except ImportError as e:
+    LOGGER.error(f"Failed to import pibooth.camera.gphoto: {e}")
+    gphoto_module = None
 
 
 # Release version
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 @pibooth.hookimpl(tryfirst=True)
 def pibooth_startup(app, cfg):
@@ -43,6 +93,7 @@ def pibooth_startup(app, cfg):
     LOGGER.info("Checking configuration:")
     LOGGER.info("  use_picamera2: %s", cfg.get('CAMERA', 'use_picamera2'))
     LOGGER.info("  use_picamera2_hybrid: %s", cfg.get('CAMERA', 'use_picamera2_hybrid'))
+    LOGGER.info("  picamera2_gphoto2_direct: %s", cfg.get('CAMERA', 'picamera2_gphoto2_direct'))
     LOGGER.info("="*60)
 
 @pibooth.hookimpl 
@@ -54,6 +105,8 @@ def pibooth_configure(cfg):
                    "Boolean value to use Picamera2 library and the new raspberry pi camera v3")
     cfg.add_option('CAMERA', 'use_picamera2_hybrid', False,
                    "Boolean value to enable hybrid mode (Picamera2 for preview, gPhoto2 for capture)")
+    cfg.add_option('CAMERA', 'picamera2_gphoto2_direct', False,
+                   "Try direct gphoto2 initialization if proxy fails (experimental)")
     LOGGER.info("PICAMERA2 PLUGIN: Configuration options added")
 
 # This hook returns the custom camera proxy.
@@ -66,6 +119,11 @@ def pibooth_setup_camera(cfg):
     LOGGER.info("="*60)
     LOGGER.info("PICAMERA2 PLUGIN: Starting camera setup")
     LOGGER.info("="*60)
+    
+    # Check if we're on the main thread
+    import threading
+    LOGGER.info(f"Current thread: {threading.current_thread().name}")
+    LOGGER.info(f"Is main thread: {threading.current_thread() is threading.main_thread()}")
     
     rpi_picamera2_proxy = None
     gp_cam_proxy = None
@@ -97,29 +155,147 @@ def pibooth_setup_camera(cfg):
                 LOGGER.info(f"  {line}")
             if result.stderr:
                 LOGGER.warning(f"gphoto2 stderr: {result.stderr}")
+                
+            # Also try to list camera abilities
+            LOGGER.info("Running gphoto2 --abilities to check camera capabilities...")
+            result2 = subprocess.run(['gphoto2', '--abilities'], capture_output=True, text=True)
+            if "Abilities for camera" in result2.stdout:
+                LOGGER.info("gphoto2 can communicate with the camera")
+            else:
+                LOGGER.warning("gphoto2 cannot get camera abilities")
+                
+            # Kill any lingering gphoto2 processes that might be blocking
+            LOGGER.info("Checking for processes that might block camera access...")
+            try:
+                # Check for gvfs-gphoto2-volume-monitor
+                result3 = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
+                if 'gvfs-gphoto2-volume-monitor' in result3.stdout:
+                    LOGGER.warning("gvfs-gphoto2-volume-monitor is running - this can block camera access")
+                    subprocess.run(['pkill', '-f', 'gvfs-gphoto2-volume-monitor'], capture_output=True)
+                    LOGGER.info("Killed gvfs-gphoto2-volume-monitor")
+                
+                subprocess.run(['pkill', '-f', 'gphoto2'], capture_output=True)
+                time.sleep(0.5)  # Give it time to clean up
+                LOGGER.info("Cleaned up any lingering gphoto2 processes")
+            except:
+                pass
+                
         except Exception as e:
             LOGGER.error(f"Could not run gphoto2 diagnostic: {e}")
         
-        # Now try to get the proxy
-        gp_cam_proxy = get_gp_camera_proxy()
-        if gp_cam_proxy:
-            LOGGER.info("✓ gPhoto2 proxy obtained successfully")
-            LOGGER.info(f"  gPhoto2 camera type: {type(gp_cam_proxy)}")
-            # Try to get camera info
-            try:
-                if hasattr(gp_cam_proxy, 'get_summary'):
-                    summary = gp_cam_proxy.get_summary()
-                    LOGGER.info(f"  Camera summary: {summary}")
-            except Exception as e:
-                LOGGER.warning(f"  Could not get camera summary: {e}")
-        else:
-            LOGGER.warning("✗ Failed to get gPhoto2 proxy - check if DSLR is connected and turned on")
+        # Now try to get the proxy with detailed debugging
+        LOGGER.info("Calling get_gp_camera_proxy()...")
+        
+        # Check what get_gp_camera_proxy actually is
+        LOGGER.info(f"get_gp_camera_proxy function: {get_gp_camera_proxy}")
+        LOGGER.info(f"get_gp_camera_proxy module: {get_gp_camera_proxy.__module__}")
+        
+        # Check if the function has any documentation
+        if hasattr(get_gp_camera_proxy, '__doc__') and get_gp_camera_proxy.__doc__:
+            LOGGER.info(f"get_gp_camera_proxy docstring: {get_gp_camera_proxy.__doc__}")
+        
+        # Check what's available in pibooth.camera module
+        try:
+            import pibooth.camera as cam_module
+            LOGGER.info("Checking pibooth.camera module contents:")
+            camera_attrs = [attr for attr in dir(cam_module) if not attr.startswith('_')]
+            LOGGER.info(f"Available functions/classes: {camera_attrs}")
+        except Exception as e:
+            LOGGER.error(f"Could not inspect pibooth.camera module: {e}")
+        
+        # Add timing to see if it's a timeout issue
+        import time
+        start_time = time.time()
+        
+        try:
+            # First try the standard method
+            gp_cam_proxy = get_gp_camera_proxy()
+            elapsed = time.time() - start_time
+            LOGGER.info(f"get_gp_camera_proxy() completed in {elapsed:.2f} seconds")
+            
+            if gp_cam_proxy:
+                LOGGER.info("✓ gPhoto2 proxy obtained successfully")
+                LOGGER.info(f"  gPhoto2 camera type: {type(gp_cam_proxy)}")
+                LOGGER.info(f"  Camera proxy attributes: {dir(gp_cam_proxy)}")
+                # Try to get camera info
+                try:
+                    if hasattr(gp_cam_proxy, 'get_summary'):
+                        summary = gp_cam_proxy.get_summary()
+                        LOGGER.info(f"  Camera summary: {summary}")
+                except Exception as e:
+                    LOGGER.warning(f"  Could not get camera summary: {e}")
+            else:
+                LOGGER.warning("✗ get_gp_camera_proxy() returned None")
+                
+                # Try alternative method - direct gphoto2 initialization
+                if cfg.get('CAMERA', 'picamera2_gphoto2_direct'):
+                    LOGGER.info("Direct gphoto2 mode enabled - attempting alternative initialization...")
+                    try:
+                        import gphoto2 as gp
+                        LOGGER.info("gphoto2 module imported successfully")
+                        
+                        # Initialize gphoto2
+                        gp.check_result(gp.use_python_logging())
+                        
+                        # Try to get camera
+                        camera = gp.Camera()
+                        LOGGER.info("Created gp.Camera() instance")
+                        
+                        # Try to initialize
+                        camera.init()
+                        LOGGER.info("✓ Direct gphoto2 initialization successful!")
+                        
+                        # Set as proxy (this might not work with pibooth's GpCamera class)
+                        gp_cam_proxy = camera
+                        LOGGER.warning("Using direct gphoto2 camera - this may not be fully compatible")
+                        
+                    except Exception as e:
+                        LOGGER.error(f"Alternative gphoto2 initialization failed: {e}")
+                        gp_cam_proxy = None
+                else:
+                    LOGGER.info("Direct gphoto2 mode not enabled (set picamera2_gphoto2_direct = True to try)")
+                
+        except Exception as e:
+            LOGGER.error(f"Exception during get_gp_camera_proxy(): {e}")
+            import traceback
+            LOGGER.error(traceback.format_exc())
+            gp_cam_proxy = None
+            
+        if not gp_cam_proxy:
             LOGGER.warning("  Make sure:")
             LOGGER.warning("  1. DSLR is connected via USB")
             LOGGER.warning("  2. DSLR is turned ON")
             LOGGER.warning("  3. DSLR is in the correct mode (not Mass Storage)")
             LOGGER.warning("  4. You have permissions to access the camera")
             LOGGER.warning("  5. No other application is using the camera")
+            LOGGER.warning("  6. gphoto2 is properly installed: sudo apt install gphoto2 libgphoto2-dev")
+            
+            # Check if we can import gphoto2 python module
+            try:
+                import gphoto2 as gp
+                LOGGER.info("  ✓ python-gphoto2 module is installed")
+            except ImportError:
+                LOGGER.error("  ✗ python-gphoto2 module NOT installed!")
+                LOGGER.error("    Install with: pip3 install gphoto2")
+            
+            # Check USB permissions
+            try:
+                import os
+                LOGGER.info("Checking USB device permissions...")
+                result = subprocess.run(['ls', '-la', '/dev/bus/usb/'], capture_output=True, text=True)
+                if result.stdout:
+                    LOGGER.info("USB devices:")
+                    for line in result.stdout.splitlines()[:5]:  # First 5 lines
+                        LOGGER.info(f"  {line}")
+                    
+                # Check if user is in the correct groups
+                result = subprocess.run(['groups'], capture_output=True, text=True)
+                LOGGER.info(f"Current user groups: {result.stdout.strip()}")
+                if 'plugdev' not in result.stdout:
+                    LOGGER.warning("User not in 'plugdev' group - this may cause permission issues")
+                    LOGGER.warning("Fix with: sudo usermod -a -G plugdev $USER")
+            except Exception as e:
+                LOGGER.error(f"Could not check permissions: {e}")
     
     if not rpi_picamera2_proxy:
         LOGGER.info('Could not find picamera2')
@@ -444,3 +620,23 @@ class HybridPicamera2(Rpi_Picamera2):
 
 # Debug message at module load time
 LOGGER.info("PICAMERA2 PLUGIN: Module loaded successfully")
+
+# Additional debugging help
+"""
+TROUBLESHOOTING HYBRID MODE:
+
+If the DSLR is detected by gphoto2 but not by pibooth:
+
+1. Check pibooth version - some versions may have different implementations
+2. Try setting picamera2_gphoto2_direct = True in config
+3. Make sure python-gphoto2 is installed: pip3 install gphoto2
+4. Check USB permissions: sudo usermod -a -G plugdev $USER
+5. Kill blocking processes: pkill -f gvfs-gphoto2-volume-monitor
+6. Test camera directly: gphoto2 --capture-image-and-download
+
+The debug output will show:
+- Whether get_gp_camera_proxy is available
+- What functions are in pibooth.camera module
+- Whether direct gphoto2 initialization works
+- Any permission or process blocking issues
+"""
