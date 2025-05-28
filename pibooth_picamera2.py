@@ -16,11 +16,13 @@ from PIL import Image
 
 from pibooth.utils import LOGGER
 from pibooth.camera.rpi import RpiCamera
+from pibooth.camera.gphoto import GpCamera
+from pibooth.camera import get_gp_camera_proxy
 from pibooth.language import get_translated_text
 
 
 # Release version
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 @pibooth.hookimpl 
 def pibooth_configure(cfg):
@@ -28,6 +30,8 @@ def pibooth_configure(cfg):
     """
     cfg.add_option('CAMERA','use_picamera2',1,
                     "Boolean value to use Picamera2 library and the new raspberry pi camera v3")
+    cfg.add_option('CAMERA','use_picamera2_hybrid',1,
+                    "Boolean value to enable hybrid mode (Picamera2 for preview, gPhoto2 for capture)")
 
 # This hook returns the custom camera proxy.
 # It is defined here because yield statement in a hookwrapper with a 
@@ -37,14 +41,28 @@ def pibooth_configure(cfg):
 def pibooth_setup_camera(cfg):
     
     rpi_picamera2_proxy = None
+    gp_cam_proxy = None
+    
     if cfg.get('CAMERA','use_picamera2'):
         rpi_picamera2_proxy = get_rpi_picamera2_proxy()
+    
+    if cfg.get('CAMERA','use_picamera2_hybrid'):
+        gp_cam_proxy = get_gp_camera_proxy()
     
     if not rpi_picamera2_proxy:
         LOGGER.info('Could not find picamera2')
         LOGGER.info('Attempting to configure other cameras')
         return
-    return Rpi_Picamera2(rpi_picamera2_proxy) 
+    
+    # Check if we have both cameras for hybrid mode
+    if rpi_picamera2_proxy and gp_cam_proxy and cfg.get('CAMERA','use_picamera2_hybrid'):
+        LOGGER.info("Configuring hybrid camera (Picamera2 + gPhoto2) ...")
+        return HybridPicamera2(rpi_picamera2_proxy, gp_cam_proxy)
+    elif rpi_picamera2_proxy:
+        LOGGER.info("Configuring Picamera2 camera ...")
+        return Rpi_Picamera2(rpi_picamera2_proxy)
+    
+    return None
 
 
 def get_rpi_picamera2_proxy():
@@ -232,7 +250,7 @@ class Rpi_Picamera2(RpiCamera):
         if self._cam._preview:
             # Use method implemented in the parent class
             super().stop_preview()
-            LOGGER.info('Sopped preview')
+            LOGGER.info('Stopped preview')
             
     def capture(self, effect=None):
         """Capture a new picture in a file.
@@ -258,3 +276,54 @@ class Rpi_Picamera2(RpiCamera):
         """Close camera
         """
         self._cam.close()
+
+
+class HybridPicamera2(Rpi_Picamera2):
+    """Camera management using the Picamera2 for the preview (better
+    video rendering) and a gPhoto2 compatible camera for the capture (higher
+    resolution)
+    """
+    # Use gPhoto2 effects for capture
+    IMAGE_EFFECTS = GpCamera.IMAGE_EFFECTS
+
+    def __init__(self, rpi_picamera2_proxy, gp_camera_proxy):
+        super(HybridPicamera2, self).__init__(rpi_picamera2_proxy)
+        self._gp_cam = GpCamera(gp_camera_proxy)
+        self._gp_cam._captures = self._captures  # Same dict for both cameras
+
+    def initialize(self, *args, **kwargs):
+        """Ensure that both cameras are initialized.
+        """
+        super(HybridPicamera2, self).initialize(*args, **kwargs)
+        self._gp_cam.initialize(*args, **kwargs)
+
+    def _post_process_capture(self, capture_data):
+        """Rework capture data.
+        :param capture_data: couple (GPhotoPath, effect)
+        :type capture_data: tuple
+        """
+        return self._gp_cam._post_process_capture(capture_data)
+
+    def capture(self, effect=None):
+        """Capture a picture using gPhoto2 camera.
+        """
+        # Stop Picamera2 before gPhoto2 capture to avoid conflicts
+        if self._cam._preview:
+            self._cam.stop()
+        
+        # Capture with gPhoto2 camera
+        self._gp_cam.capture(effect)
+        
+        # Hide overlay if it's still showing
+        self._hide_overlay()
+        
+        # Restart Picamera2 for next preview if window is available
+        if self._window and self._preview_config:
+            self._cam.configure(self._preview_config)
+            self._cam.start()
+
+    def quit(self):
+        """Close both camera drivers.
+        """
+        super(HybridPicamera2, self).quit()
+        self._gp_cam.quit()
