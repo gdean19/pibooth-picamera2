@@ -82,7 +82,7 @@ except ImportError as e:
 
 
 # Release version
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 @pibooth.hookimpl(tryfirst=True)
 def pibooth_startup(app, cfg):
@@ -365,6 +365,7 @@ class Rpi_Picamera2(RpiCamera):
         super().__init__(camera_proxy)
         self._preview_config = None
         self._capture_config = None
+        self._is_preview_active = False  # Track preview state
         
     def _specific_initialization(self):
         """Camera initialization.
@@ -376,6 +377,13 @@ class Rpi_Picamera2(RpiCamera):
         
         self._capture_config = self._cam.create_still_configuration(main={'size':resolution},
                                 transform=Transform(hflip=self.capture_flip))
+    
+    def _is_camera_running(self):
+        """Safely check if camera is running."""
+        try:
+            return hasattr(self._cam, '_preview') and self._cam._preview
+        except:
+            return False
     
     def _show_overlay(self, text, alpha):
         """Add an image as an overlay
@@ -434,9 +442,11 @@ class Rpi_Picamera2(RpiCamera):
         return super().get_rect(max_size) 
 
     def preview(self, window, flip=True):
-        if self._cam._preview:
-            # Preview is still running
+        # Check if preview is already running
+        if self._is_preview_active:
+            LOGGER.info("Preview already active, skipping initialization")
             return
+            
         # create rect dimensions for preview window
         self._window = window
         
@@ -452,9 +462,23 @@ class Rpi_Picamera2(RpiCamera):
             else:
                 self._preview_config['transform'] = Transform(hflip=flip)
 
-        self._cam.configure(self._preview_config)
-        self._cam.start()
-        self.update_preview()
+        try:
+            # Make sure camera is stopped before configuring
+            try:
+                self._cam.stop()
+                time.sleep(0.1)
+            except:
+                pass  # Already stopped
+                
+            self._cam.configure(self._preview_config)
+            self._cam.start()
+            self._is_preview_active = True
+            self.update_preview()
+            LOGGER.info("Preview started successfully")
+        except Exception as e:
+            LOGGER.error(f"Error starting preview: {e}")
+            self._is_preview_active = False
+            raise
 
     def preview_countdown(self, timeout, alpha=60):
         """Show a countdown of 'timeout' seconds on the preview.
@@ -465,7 +489,7 @@ class Rpi_Picamera2(RpiCamera):
         timeout = int(timeout)
         if timeout < 1:
             raise ValueError('Start time shall be greater than 0')
-        if not self._cam._preview:
+        if not self._is_preview_active:
             raise RuntimeError('Preview shall be started first')
         time_stamp = time.time() 
         
@@ -495,6 +519,10 @@ class Rpi_Picamera2(RpiCamera):
 
     def update_preview(self):
         """Capture image and update screen with image"""
+        if not self._is_preview_active:
+            LOGGER.warning("update_preview called but preview not active")
+            return
+            
         try:
             array = self._cam.capture_array('main')
             rect = self.get_rect(self.MAX_RESOLUTION)
@@ -514,13 +542,20 @@ class Rpi_Picamera2(RpiCamera):
             pygame.display.update()
         except Exception as e:
             LOGGER.error(f"Error updating preview: {e}")
-            raise 
+            # Don't re-raise to avoid breaking the preview loop 
 
     def stop_preview(self):
-        if self._cam._preview:
+        if not self._is_preview_active:
+            LOGGER.info('Preview already stopped')
+            return
+            
+        try:
             # Use method implemented in the parent class
             super().stop_preview()
+            self._is_preview_active = False
             LOGGER.info('Stopped preview')
+        except Exception as e:
+            LOGGER.warning(f'Error stopping preview: {e}')
             
     def capture(self, effect=None):
         """Capture a new picture in a file.
@@ -533,19 +568,50 @@ class Rpi_Picamera2(RpiCamera):
 
         stream = BytesIO()
         
-        self._cam.switch_mode(self._capture_config)
-        self._cam.capture_file(stream, format='jpeg')
-
-        self._captures.append(stream)
-        # Reconfigure and Stop camera before next preview
-        self._cam.switch_mode(self._preview_config)
-        self._cam.stop()
+        try:
+            # Stop preview if it's running
+            if self._is_preview_active:
+                LOGGER.info("Stopping preview for capture")
+                self._cam.stop()
+                self._is_preview_active = False
+                time.sleep(0.1)
+            
+            # Configure and start in capture mode
+            self._cam.configure(self._capture_config)
+            self._cam.start()
+            
+            # Capture the image
+            self._cam.capture_file(stream, format='jpeg')
+            self._captures.append(stream)
+            
+            # Stop camera after capture
+            self._cam.stop()
+            time.sleep(0.1)  # Small delay to ensure camera is fully stopped
+            
+            LOGGER.info("Capture completed successfully")
+                
+        except Exception as e:
+            LOGGER.error(f"Error during capture: {e}")
+            # Try to recover
+            try:
+                self._cam.stop()
+                self._is_preview_active = False
+            except:
+                pass
+            raise
        
 
     def quit(self):
         """Close camera
         """
-        self._cam.close()
+        try:
+            if self._is_preview_active or self._is_camera_running():
+                self._cam.stop()
+                self._is_preview_active = False
+        except:
+            pass
+        finally:
+            self._cam.close()
 
 
 class HybridPicamera2(Rpi_Picamera2):
@@ -586,10 +652,17 @@ class HybridPicamera2(Rpi_Picamera2):
         """
         LOGGER.info(f"HybridPicamera2: Starting capture with effect={effect}")
         
-        # Stop Picamera2 before gPhoto2 capture to avoid conflicts
-        if self._cam._preview:
+        # Stop Picamera2 if preview is active
+        if self._is_preview_active:
             LOGGER.info("HybridPicamera2: Stopping Picamera2 preview before DSLR capture")
-            self._cam.stop()
+            try:
+                self._cam.stop()
+                self._is_preview_active = False
+                time.sleep(0.2)  # Give more time for camera to fully stop
+            except Exception as e:
+                LOGGER.warning(f"HybridPicamera2: Error stopping Picamera2: {e}")
+        else:
+            LOGGER.info("HybridPicamera2: Picamera2 preview not active")
         
         # Capture with gPhoto2 camera
         LOGGER.info("HybridPicamera2: Triggering DSLR capture via gPhoto2")
@@ -598,16 +671,23 @@ class HybridPicamera2(Rpi_Picamera2):
             LOGGER.info("HybridPicamera2: DSLR capture successful")
         except Exception as e:
             LOGGER.error(f"HybridPicamera2: DSLR capture failed: {e}")
+            # Try to restart preview on failure
+            if self._window and self._preview_config and not self._is_preview_active:
+                try:
+                    self.preview(self._window)
+                except:
+                    pass
             raise
         
         # Hide overlay if it's still showing
-        self._hide_overlay()
+        if self._overlay:
+            self._hide_overlay()
         
-        # Restart Picamera2 for next preview if window is available
-        if self._window and self._preview_config:
-            LOGGER.info("HybridPicamera2: Restarting Picamera2 for preview")
-            self._cam.configure(self._preview_config)
-            self._cam.start()
+        # Note: Don't restart preview here - let pibooth handle it
+        LOGGER.info("HybridPicamera2: Capture complete, ready for next preview")
+        
+        # Small delay to ensure everything is settled
+        time.sleep(0.1)
 
     def quit(self):
         """Close both camera drivers.
@@ -639,4 +719,11 @@ The debug output will show:
 - What functions are in pibooth.camera module
 - Whether direct gphoto2 initialization works
 - Any permission or process blocking issues
+
+CAMERA STATE MANAGEMENT (v1.2.0):
+- Added proper state tracking to prevent "Camera must be stopped before configuring" errors
+- Picamera2 is properly stopped before DSLR captures
+- Preview state is tracked with _is_preview_active flag
+- Added delays between stop/start operations for stability
+- Improved error recovery if camera gets into bad state
 """
